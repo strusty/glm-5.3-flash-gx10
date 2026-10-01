@@ -16,7 +16,9 @@ services:
     environment:
       - TP=3
       # adaptive-k.yaml's EXTRA_ARGS plus a data-parallel vision tower: its 16
-      # ViT heads and 10240-wide merger do not split by 3.
-      - EXTRA_ARGS=--scheduler-cls vllm.v1.core.sched.adaptive_k.AdaptiveKScheduler --speculative-config {"method":"dflash","model":"/models/glm-5.3-flash-dflash2","num_speculative_tokens":7,"attention_backend":"TRITON_ATTN","num_speculative_tokens_per_batch_size":[[1,1,7],[2,2,5],[3,3,4],[4,4,3],[5,5,2],[6,32,7]]} --mm-encoder-tp-mode data
+      # ViT heads and 10240-wide merger do not split by 3. Keep #60's
+      # disable_eagle_block_drop in sync: without it every cache hit here
+      # recomputes a whole 3,584-token block.
+      - EXTRA_ARGS=--scheduler-cls vllm.v1.core.sched.adaptive_k.AdaptiveKScheduler --speculative-config {"method":"dflash","disable_eagle_block_drop":true,"model":"/models/glm-5.3-flash-dflash2","num_speculative_tokens":7,"attention_backend":"TRITON_ATTN","num_speculative_tokens_per_batch_size":[[1,1,7],[2,2,5],[3,3,4],[4,4,3],[5,5,2],[6,32,7]]} --mm-encoder-tp-mode data
       # Padded weights process differently: never restore a TP=4 snapshot.
       - VLLM_WEIGHT_SNAPSHOT_TAG=tp3pad-2026-09-28
