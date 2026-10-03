@@ -47,6 +47,13 @@ from vllm.v1.worker.block_table import get_block_table_width
 
 logger = init_logger(__name__)
 
+# GLM53-DRAFT-POOL: data_ptrs of the drafter's own KV pool, recorded by the block
+# zeroer, which tells drafter layers by spec. copy_kv_cache_blocks_inplace skips
+# them: its block ids address the target pool, and the drafter pool has a block
+# count of its own (705 against 567 at TP=3), so a partial prefix-cache hit would
+# otherwise fail the divisibility assert or write target block ids into it.
+_DRAFT_POOL_KV_PTRS: set[int] = set()
+
 
 def raise_if_nan_logits(num_nans_in_logits: Mapping[str, int]) -> None:
     if not any(num_nans_in_logits.values()):
@@ -180,6 +187,7 @@ class KVBlockZeroer:
                 # pages outnumber the 3584-token target blocks (705 to 567).
                 if (isinstance(spec, DraftSlidingWindowSpec)
                         and _glm5_next_draft_pool_enabled()):
+                    _DRAFT_POOL_KV_PTRS.add(dp)  # the copy path skips these too
                     continue
                 assert kv.shape[0] % num_blocks == 0, (
                     f"{layer_name}: {kv.shape[0]} kernel blocks is not a "
@@ -712,6 +720,9 @@ def copy_kv_cache_blocks_inplace(
         if key in seen:
             continue
         seen.add(key)
+        # GLM53-DRAFT-POOL: these block ids do not address the drafter's pool.
+        if cache.data_ptr() in _DRAFT_POOL_KV_PTRS:
+            continue
 
         if indices is None:
             indices = async_tensor_h2d(indices_np, device=cache.device)
