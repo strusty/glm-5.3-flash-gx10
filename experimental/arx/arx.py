@@ -154,7 +154,12 @@ class ArxCommunicator:
         dist.barrier(group=group)
         _taken = True
         self.ext = ext
-        self.max_bytes = min(int(os.environ.get("VLLM_ARX_MAX_BYTES", 256 << 10)), ext.max_bytes())
+        # Ring mode has no two-shot path above max_bytes (two-shot is mesh only), so
+        # everything larger falls back to NCCL. Default the one-shot limit to the whole
+        # compiled buffer there: decode batches of 33-64 verify rows (bf16 x 4096) stay
+        # on arx.
+        default_max = (512 << 10) if ring else (256 << 10)
+        self.max_bytes = min(int(os.environ.get("VLLM_ARX_MAX_BYTES", default_max)), ext.max_bytes())
         # Two-shot (reduce-scatter + all-gather) for all-reduces above max_bytes,
         # up to this size: 2-2.7x faster than NCCL from 512 KB. Mesh only; 0 is off.
         self.two_shot_max = min(int(os.environ.get("VLLM_ARX_TWO_SHOT_MAX_KB", "0")) << 10, ext.max_bytes2())
