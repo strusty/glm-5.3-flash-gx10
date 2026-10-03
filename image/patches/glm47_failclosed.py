@@ -38,6 +38,34 @@ Name resolution takes an exact match first, then the longest offered name the
 emitted one starts with, so `bash</arg_key>...` resolves to `bash` while
 `bash1635` does not.
 
+## Nested and abandoned calls
+
+Two shapes pass the checks above with valid keys and still carry the wrong call:
+
+- A call opened inside the think block. GLM's `(REASONING, TOOL_START)` transition
+  ends reasoning implicitly, so a `<tool_call>` written mid-thought opens a call
+  whose argument then swallows the rest of the reasoning, the `</think>` and the
+  call written after it. Upstream executes it with the reasoning as its argument.
+- An abandoned call: `bash<arg_key>command</arg_key><arg_value># note\nweb_search
+  <arg_key>query...`, where the model switched tools without closing the first.
+
+At call end the text after `</think><tool_call>NAME<arg_key>`, or an offered tool
+name directly followed by `<arg_key>` inside an argument value, is checked as a
+call of its own. When it passes, the outer call is refused with a reason that
+spells out the recovered call, so the model re-issues it in one step. Recovered
+text is never executed: it could be a file's content, and GLM's format cannot
+carry literal `<arg_key>` or `</tool_call>` inside an argument anyway.
+`GLM47_REPAIR=0` turns this off.
+
+## Streaming
+
+Arguments are buffered until the call ends, so a long call sends nothing while it
+is written; clients with an idle timeout drop the stream. While a call is
+buffered, an empty argument delta goes out every `GLM47_KEEPALIVE_S` seconds
+(default 5, 0 turns it off). A refused call whose name was already streamed is
+re-offered with arguments only: clients that concatenate deltas (the openai
+SDK's stream helper) would otherwise read the name twice.
+
 `GLM47_FAIL_CLOSED=0` restores upstream behaviour. `GLM47_REJECT_AS_TEXT=1`
 surfaces refusals as content instead, which is the pre-#11 behaviour and ends
 agent loops.
@@ -48,6 +76,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 
 # Moved from vllm.entrypoints.openai.engine.protocol on vLLM main; the old
 # path is why this plugin failed to register on the 2026-09-22 nightly.
@@ -82,6 +111,13 @@ def _flag(name: str, default: str) -> bool:
 
 ENABLED = _flag("GLM47_FAIL_CLOSED", "1")
 REJECT_AS_TEXT = _flag("GLM47_REJECT_AS_TEXT", "0")
+REPAIR = _flag("GLM47_REPAIR", "1")
+KEEPALIVE_S = float(os.environ.get("GLM47_KEEPALIVE_S", "5"))
+
+ARG_KEY = "<arg_key>"
+NAME_CHAR = re.compile(r"[A-Za-z0-9_.-]")
+# A call opened inside the think block: the reasoning close, a new call, its first key.
+NESTED_RE = re.compile(r"</think>\s*<tool_call>\s*([A-Za-z_][A-Za-z0-9_.-]{0,63})\s*<arg_key>")
 
 
 class Glm47FailClosedParser(Glm47MoeParser):
@@ -95,10 +131,73 @@ class Glm47FailClosedParser(Glm47MoeParser):
         # Sentinel arguments of refused calls by call id. A non-streaming result
         # is rebuilt from each slot's raw arguments, so it needs these too.
         self._refused: dict[str, str] = {}
+        # When each buffered slot last sent anything, for the keep-alive.
+        self._last_emit: dict[int, float] = {}
 
     def _reset(self, *args, **kwargs) -> None:
         super()._reset(*args, **kwargs)
         self._refused = {}
+        self._last_emit = {}
+
+    def _handle_arg_chunk(self, event, deltas) -> None:
+        super()._handle_arg_chunk(event, deltas)
+        if KEEPALIVE_S <= 0 or self._stream_arg_deltas:
+            return
+        idx = event.tool_index
+        if not (0 <= idx < len(self._tool_slots)) or not self._tool_slots[idx].name_sent:
+            return
+        now = time.monotonic()
+        last = self._last_emit.get(idx)
+        if last is None or any(d.index == idx for d in deltas):
+            self._last_emit[idx] = now
+            return
+        if now - last >= KEEPALIVE_S:
+            self._last_emit[idx] = now
+            deltas.append(DeltaToolCall(index=idx, function=DeltaFunctionCall(arguments="")))
+
+    def _json_for(self, name: str, raw: str) -> str | None:
+        converter = self._arg_converter
+        if converter is None:
+            return None
+        try:
+            text = converter(raw, False)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return None
+        return self._fix_arg_types(text, name) if text else text
+
+    def _recover(self, idx: int) -> tuple[str, str, str] | None:
+        """(kind, name, arguments JSON) of a valid call nested in this slot's arguments."""
+        raw = self._tool_slots[idx].args or ""
+        found = None
+        m = None
+        for m in NESTED_RE.finditer(raw):
+            pass  # the last one is the call the model finished
+        if m is not None:
+            found = ("nested", m.group(1), raw[m.end() - len(ARG_KEY):])
+        else:
+            best = None
+            for name in self._offered_names():
+                start = 0
+                while (j := raw.find(name + ARG_KEY, start)) != -1:
+                    start = j + 1
+                    if j == 0 or NAME_CHAR.match(raw[j - 1]):
+                        continue  # the call's own first key, or the tail of a longer name
+                    if raw.rfind("<arg_value>", 0, j) <= raw.rfind("</arg_value>", 0, j):
+                        continue  # not inside an argument value
+                    if best is None or j < best[0]:
+                        best = (j, name)
+                    break
+            if best is not None:
+                found = ("abandoned", best[1], raw[best[0] + len(best[1]):])
+        if found is None:
+            return None
+        kind, name, args_raw = found
+        if args_raw.endswith("</tool_call>"):
+            args_raw = args_raw[: -len("</tool_call>")]
+        args_json = self._json_for(name, args_raw)
+        if args_json is None or self._reject_reason(name, args_json) is not None:
+            return None
+        return kind, name, args_json
 
     def _args_json(self, idx: int) -> str:
         """The slot's arguments as the client would receive them.
@@ -202,8 +301,20 @@ class Glm47FailClosedParser(Glm47MoeParser):
         slot = self._tool_slots[idx]
         emitted = (slot.name or self._try_extract_name(idx) or "").strip()
         resolved = self._resolve_name(emitted)
-        # Converting here leaves the slot and the converter's state alone.
-        reason = self._reject_reason(resolved or emitted, self._args_json(idx))
+        was_sent = slot.name_sent
+        recovered = self._recover(idx) if REPAIR else None
+        if recovered is not None:
+            kind, rec_name, rec_args = recovered
+            how = ("was opened inside your reasoning, so its arguments swallowed the rest "
+                   "of the reasoning and the call you wrote after it" if kind == "nested" else
+                   "was left unfinished when you started another call inside its arguments")
+            reason = (f"nothing was run: this {resolved or emitted or 'tool'} call {how}. The call "
+                      f"you meant appears to be {rec_name} with arguments {rec_args}; issue it on its "
+                      f"own. (To write tool-call markup literally inside an argument, split the "
+                      f"tags, e.g. '</th' + 'ink>'.)")
+        else:
+            # Converting here leaves the slot and the converter's state alone.
+            reason = self._reject_reason(resolved or emitted, self._args_json(idx))
         if reason is None:
             if resolved and resolved != emitted:
                 slot.name = resolved
@@ -232,14 +343,19 @@ class Glm47FailClosedParser(Glm47MoeParser):
         arguments = json.dumps({SENTINEL_KEY: reason}, ensure_ascii=False)
         slot.streamed_json = arguments
         self._refused[slot.id] = arguments
-        deltas.append(
-            DeltaToolCall(
-                index=idx,
-                id=slot.id,
-                type="function",
-                function=DeltaFunctionCall(name=name, arguments=arguments),
+        if was_sent:
+            # The client already has this call's name and id: arguments only, or a
+            # client that concatenates deltas reads the name twice.
+            deltas.append(DeltaToolCall(index=idx, function=DeltaFunctionCall(arguments=arguments)))
+        else:
+            deltas.append(
+                DeltaToolCall(
+                    index=idx,
+                    id=slot.id,
+                    type="function",
+                    function=DeltaFunctionCall(name=name, arguments=arguments),
+                )
             )
-        )
 
 
 _REASONING_ADAPTER, _TOOL_ADAPTER = make_adapters(Glm47FailClosedParser)
