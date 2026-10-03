@@ -18,6 +18,11 @@ services:
       - TP=3
       # adaptive-k.yaml's scheduler plus a data-parallel vision tower: its 16
       # ViT heads and 10240-wide merger do not split by 3.
-      - EXTRA_ARGS=--scheduler-cls vllm.v1.core.sched.adaptive_k.AdaptiveKScheduler --mm-encoder-tp-mode data
+      # --prefix-match-unit 64: hash prompts every 64 tokens instead of every
+      # 3,584-token block. In mamba align mode vLLM then keeps a KDA checkpoint at
+      # the prompt's last 64-token boundary, so a request that extends an earlier
+      # prompt (every agent or chat turn) resumes there instead of at the last
+      # whole block. Needs the drafter-pool skip in fixes/worker_utils.py.
+      - EXTRA_ARGS=--scheduler-cls vllm.v1.core.sched.adaptive_k.AdaptiveKScheduler --mm-encoder-tp-mode data --prefix-match-unit 64
       # Padded weights process differently: never restore a TP=4 snapshot.
       - VLLM_WEIGHT_SNAPSHOT_TAG=tp3pad-2026-09-28
