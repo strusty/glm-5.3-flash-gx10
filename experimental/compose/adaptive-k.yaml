@@ -35,3 +35,14 @@ services:
       - VLLM_ADAPTIVE_K_ONLINE=${VLLM_ADAPTIVE_K_ONLINE:-1}
       - VLLM_ADAPTIVE_K_MODEL=${VLLM_ADAPTIVE_K_MODEL:-}
       - VLLM_ADAPTIVE_K_COST_MS=${VLLM_ADAPTIVE_K_COST_MS:-2:29.7,3:33.1,4:36.5,5:39.8,6:43.1,7:46.0,8:48.9}
+      # Opt-in scheduling for mixed agent traffic (adaptive_k.py, the block above the class). All off by default.
+      # VLLM_PREFILL_CADENCE=4: while a long cold prompt is read beside decoding streams, prefill runs on every 4th
+      # step only, so the others keep writing (at TP=3: 1.6 -> 4.7 tok/s each during a 100k read, read 37 -> 43 s).
+      # VLLM_PRIO_PREFILL=1 and VLLM_MARKER_PRIORITY/VLLM_MARKER_IDS need --scheduling-policy priority in EXTRA_ARGS.
+      # The JSON file named by VLLM_SCHED_CTL overrides any of them live, e.g. {"cadence":4,"prio_prefill":1}.
+      - VLLM_SCHED_CTL=/root/.cache/sched-ctl.json
+      - VLLM_PREFILL_CADENCE=${VLLM_PREFILL_CADENCE:-1}
+      - VLLM_PREFILL_CADENCE_MIN=${VLLM_PREFILL_CADENCE_MIN:-8192}
+      - VLLM_PRIO_PREFILL=${VLLM_PRIO_PREFILL:-0}
+      - VLLM_MARKER_PRIORITY=${VLLM_MARKER_PRIORITY:-0}
+      - VLLM_MARKER_IDS=${VLLM_MARKER_IDS:-}

@@ -82,6 +82,51 @@ _MODEL = tuple(float(v) for v in (os.environ.get("VLLM_ADAPTIVE_K_MODEL") or "27
 _EXPERTS, _TOPK = 288, 8
 
 
+# --- Opt-in scheduling for mixed agent traffic. Everything is OFF by default: with no env and no control file the
+# scheduler behaves exactly as above. Settings come from env, and can be overridden live from a JSON file named by
+# VLLM_SCHED_CTL (re-read when it changes, so each knob can be A/B-tested without a restart):
+#   "cadence" N (VLLM_PREFILL_CADENCE): while a LONG prefill (>= "cadence_min" prompt tokens still to read) runs
+#       beside decoding requests, only every Nth step schedules prefill work; the steps between are decode-only.
+#       Uses vLLM's own throttle_prefills path (built for DP prefill balancing), which never starves the waiting
+#       queue. Others keep writing while a big cold prompt is read in, at the cost of a longer read.
+#   "cadence_latch" (VLLM_PREFILL_CADENCE_LATCH, default 1): stock vLLM drops the throttle whenever requests are
+#       queued (prefill_capacity_bound), which is exactly during agent bursts; 1 clears that latch on cadence steps.
+#       Waiting requests are still admitted on every Nth step.
+#   "prio_prefill" (VLLM_PRIO_PREFILL=1): with --scheduling-policy priority, while a request with a better (lower)
+#       priority waits or is still reading its prompt, running prefills of worse priority sit out the step (they
+#       keep their KV blocks, as when the token budget runs out), so an interactive turn is not stuck behind a
+#       burst of background prompt reads.
+#   "marker_priority" P (VLLM_MARKER_PRIORITY) with VLLM_MARKER_IDS="id,id,...": with --scheduling-policy priority,
+#       a new request with priority 0 whose first 16k prompt tokens contain that token sequence gets priority P.
+#       For clients that cannot set the request's `priority` field themselves. Example: Hermes sub-agents, whose
+#       system prompt starts "You are a focused subagent working on a specific delegated task." -- with this
+#       checkpoint's tokenizer, " focused subagent working on a specific delegated task" is
+#       10730,1186,8091,3238,389,264,3151,89908,3383.
+def _env_ids(name: str) -> list[int]:
+    return [int(x) for x in os.environ.get(name, "").replace(" ", "").split(",") if x]
+
+
+_MARKER = _env_ids("VLLM_MARKER_IDS")
+_CTL_DEFAULTS = {
+    "cadence": int(os.environ.get("VLLM_PREFILL_CADENCE", "1")),
+    "cadence_min": int(os.environ.get("VLLM_PREFILL_CADENCE_MIN", "8192")),
+    "cadence_latch": int(os.environ.get("VLLM_PREFILL_CADENCE_LATCH", "1")),
+    "prio_prefill": int(os.environ.get("VLLM_PRIO_PREFILL", "0")),
+    "marker_priority": int(os.environ.get("VLLM_MARKER_PRIORITY", "0")),
+}
+
+
+def _has_marker(ids, limit: int = 16384) -> bool:
+    if not _MARKER or ids is None:
+        return False
+    ids = ids[:limit]
+    first, n = _MARKER[0], len(_MARKER)
+    for i, t in enumerate(ids):
+        if t == first and list(ids[i:i + n]) == _MARKER:
+            return True
+    return False
+
+
 class _CostModel:
     """step_ms = base + per_expert * experts(d * t) + per_token * t, learned online.
 
@@ -137,6 +182,12 @@ def _parse_costs(spec: str) -> tuple[np.ndarray, np.ndarray]:
 class AdaptiveKScheduler(AsyncScheduler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self._ctl = dict(_CTL_DEFAULTS)
+        self._ctl_path = os.environ.get("VLLM_SCHED_CTL", "")
+        self._ctl_mtime = 0.0
+        self._ctl_checked = 0.0
+        self._cadence_i = 0
+        self._read_sched_ctl(force_log=True)
         lookup = self.dynamic_sd_lookup or [self.num_spec_tokens]
         self._levels = sorted({k for k in lookup[1:] if 0 < k <= self.num_spec_tokens}) or [self.num_spec_tokens]
         self._cost_x, self._cost_y = _parse_costs(
@@ -372,3 +423,77 @@ class AdaptiveKScheduler(AsyncScheduler):
             self._k = k
             scheduler_output.num_spec_tokens_to_schedule = self._k
         super()._update_after_schedule(scheduler_output)
+
+    # --- opt-in scheduling extensions (see the block above the class) ---
+    def _read_sched_ctl(self, force_log: bool = False) -> None:
+        now = time.monotonic()
+        if not force_log and now - self._ctl_checked < 0.5:
+            return
+        self._ctl_checked = now
+        if not self._ctl_path:
+            if force_log:
+                logger.info("scheduling extensions: %s (no VLLM_SCHED_CTL)", self._ctl)
+            return
+        try:
+            mtime = os.stat(self._ctl_path).st_mtime
+        except OSError:
+            mtime = 0.0
+        if mtime == self._ctl_mtime and not force_log:
+            return
+        self._ctl_mtime = mtime
+        ctl = dict(_CTL_DEFAULTS)
+        if mtime:
+            try:
+                import json
+                ctl.update({k: v for k, v in json.load(open(self._ctl_path)).items() if k in ctl})
+            except Exception as e:  # noqa: BLE001 — a bad file must not stop serving
+                logger.warning("scheduling extensions: cannot read %s (%s); keeping %s", self._ctl_path, e, self._ctl)
+                return
+        if ctl != self._ctl or force_log:
+            logger.info("scheduling extensions: %s", ctl)
+        self._ctl = ctl
+
+    def add_request(self, request) -> None:
+        p = self._ctl.get("marker_priority", 0)
+        if (p and request.request_id not in self.requests and getattr(request, "priority", 0) == 0
+                and getattr(self.policy, "name", "") == "PRIORITY" and _has_marker(request.prompt_token_ids)):
+            request.priority = int(p)
+        super().add_request(request)
+
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        self._read_sched_ctl()
+        parked = self._park_worse_prefills() if self._ctl["prio_prefill"] else []
+        if self._ctl["cadence"] > 1 and not throttle_prefills:
+            throttle_prefills = self._cadence_throttle()
+            if throttle_prefills and self._ctl["cadence_latch"]:
+                self.prefill_capacity_bound = False
+        try:
+            return super().schedule(throttle_prefills)
+        finally:
+            for i, r in parked:               # back where they were in `running`
+                self.running.insert(min(i, len(self.running)), r)
+
+    def _park_worse_prefills(self) -> list:
+        """While a better-priority request waits or is still reading its prompt, take worse-priority running
+        prefills out of this step (they resume once it is through its prefill)."""
+        filling = [r.priority for r in self.running if r.num_computed_tokens < r.num_prompt_tokens]
+        cands = [r.priority for r in self.waiting] + filling
+        if not cands:
+            return []
+        best = min(cands)
+        parked = [(i, r) for i, r in enumerate(self.running)
+                  if r.priority > best and r.num_computed_tokens < r.num_prompt_tokens
+                  and getattr(r, "num_output_placeholders", 0) == 0]
+        for _, r in reversed(parked):
+            self.running.remove(r)
+        return parked
+
+    def _cadence_throttle(self) -> bool:
+        n, lmin = self._ctl["cadence"], self._ctl["cadence_min"]
+        long_fill = any(r.is_prefill_chunk and r.num_prompt_tokens - r.num_computed_tokens >= lmin for r in self.running)
+        decoding = any(not r.is_prefill_chunk for r in self.running)
+        if not (long_fill and decoding):
+            self._cadence_i = 0
+            return False
+        self._cadence_i = (self._cadence_i + 1) % n
+        return self._cadence_i != 0
