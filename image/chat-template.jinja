@@ -2,7 +2,10 @@
 {#- Thinking off maps to low effort; the model was never trained on an empty <think></think>. -#}
 {%- set thinking_off = (thinking is defined and not thinking) or (enable_thinking is defined and not enable_thinking) -%}
 {%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else ('low' if thinking_off else 'max') -%}
-{%- if effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
+{#- effort_tail=true (chat_template_kwargs, opt-in) renders the effort line just before the reply
+    instead of at token 3, so switching effort mid-conversation keeps the prefix cache (Mia patch 0096 idea). -#}
+{%- set effort_tail = effort_tail if effort_tail is defined else false -%}
+{%- if effective_reasoning_effort is not none and not effort_tail -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
 {%- set clear_thinking = clear_thinking if clear_thinking is defined else false -%}
 {%- if tools -%}
 {%- macro tool_to_json(tool) -%}
@@ -255,5 +258,6 @@ For each function call, output the function name and arguments within the follow
 {%- endif -%}
 {%- endfor -%}
 {%- if add_generation_prompt -%}
+    {%- if effort_tail and effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
     <|assistant|>{{- '<think>' -}}
 {%- endif -%}
